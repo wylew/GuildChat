@@ -11,10 +11,6 @@ import java.nio.ByteOrder
 import java.security.MessageDigest
 import kotlin.random.Random
 
-/**
- * Manages the World Server session lifecycle and heartbeats.
- * Cited Reference: tuicraft/src/world/session.ts and gtker/wow_messages
- */
 class WorldSession(
     private val host: String,
     private val port: Int,
@@ -24,142 +20,105 @@ class WorldSession(
     private val connection = WorldConnection(host, port)
     private val _state = MutableStateFlow<SessionState>(SessionState.Disconnected)
     val state: StateFlow<SessionState> = _state
-
+    private val _characters = MutableStateFlow<List<WorldServerCharEnum.Character>>(emptyList())
+    val characters: StateFlow<List<WorldServerCharEnum.Character>> = _characters
     private val _messages = MutableSharedFlow<ChatMessage>()
     val messages: SharedFlow<ChatMessage> = _messages
 
-    private val _characters = MutableStateFlow<List<WorldServerCharEnum.Character>>(emptyList())
-    val characters: StateFlow<List<WorldServerCharEnum.Character>> = _characters
-
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var keepAliveJob: Job? = null
-    private val clientSeed = Random.nextInt()
-    
-    // Monotonic clock for time synchronization
-    private val sessionStartTime = System.nanoTime()
-
-    private fun getSessionTicks(): Int {
-        return ((System.nanoTime() - sessionStartTime) / 1_000_000).toInt()
-    }
+    private val clientSeed = Random.nextInt(0, Int.MAX_VALUE)
 
     suspend fun connect() {
         _state.value = SessionState.WorldConnect
+        connection.setOnDisconnect { _ -> 
+             if (_state.value !is SessionState.Error) _state.value = SessionState.Disconnected
+        }
         try {
             connection.connect()
-            
             scope.launch {
                 connection.incomingPackets.collect { packet ->
                     handlePacket(packet.opcode, packet.payload)
                 }
             }
         } catch (e: Exception) {
-            _state.value = SessionState.Error("Failed to connect: ${e.message}")
+            _state.value = SessionState.Error(e.message ?: "Connect error")
         }
     }
 
     private suspend fun handlePacket(opcode: Int, payload: ByteArray) {
-        val reader = ByteReader(ByteBuffer.wrap(payload))
+        val reader = ByteReader(ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN))
         when (opcode) {
-            WorldOpcode.SMSG_AUTH_CHALLENGE -> {
-                val challenge = WorldServerAuthChallenge(reader)
-                sendAuthSession(challenge.serverSeed)
-            }
-            WorldOpcode.SMSG_AUTH_RESPONSE -> {
-                val response = WorldServerAuthResponse(reader)
-                if (response.result == 0x0C) { // AUTH_OK
+            0x1EC -> sendAuthSession(reader.readInt())
+            0x1EE -> {
+                val result = reader.readByte().toInt()
+                if (result == 0x0C) {
                     _state.value = SessionState.CharSelect
-                    startKeepAlive()
-                    sendPacket(WorldClientCharEnum())
+                    sendPacket(0x0037, ByteArray(0)) 
                 } else {
-                    _state.value = SessionState.Error("World Auth failed: ${response.result}")
+                    _state.value = SessionState.Error("Auth error: $result")
+                    connection.disconnect()
                 }
             }
-            WorldOpcode.SMSG_CHAR_ENUM -> {
-                val charEnum = WorldServerCharEnum(reader)
-                _characters.value = charEnum.characters
-            }
-            WorldOpcode.SMSG_LOGIN_VERIFY_WORLD -> {
-                _state.value = SessionState.InWorld
-            }
-            WorldOpcode.SMSG_TIME_SYNC_REQ -> {
-                val req = WorldServerTimeSyncRequest(reader)
-                sendPacket(WorldClientTimeSyncResponse(req.counter, getSessionTicks()))
-            }
-            WorldOpcode.SMSG_PONG -> {
-                WorldServerPong(reader)
-            }
-            WorldOpcode.SMSG_MESSAGECHAT -> {
-                val msg = ChatServerMessage(reader).toChatMessage()
-                _messages.emit(msg)
-            }
+            0x003B -> _characters.value = WorldServerCharEnum(reader).characters
+            0x00EE -> _state.value = SessionState.InWorld
+            0x0096 -> _messages.emit(ChatServerMessage(reader).toChatMessage())
         }
     }
 
     private suspend fun sendAuthSession(serverSeed: Int) {
         val sha = MessageDigest.getInstance("SHA-1")
-        sha.update(account.uppercase().toByteArray())
+        sha.update(account.uppercase().toByteArray(Charsets.UTF_8))
         
-        // Data to hash: AccountName (Upper) + 0000 (4 null bytes) + ClientSeed (4 bytes) + ServerSeed + SessionKey
-        val buf = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putInt(0) // 4 null bytes
-        buf.putInt(clientSeed)
-        buf.putInt(serverSeed)
-        sha.update(buf.array())
+        val pad = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
+        pad.putInt(0)
+        pad.putInt(clientSeed)
+        pad.putInt(serverSeed)
+        sha.update(pad.array())
         sha.update(sessionKey)
         val digest = sha.digest()
 
-        val authPacket = WorldClientAuthSession(
-            build = 12340,
-            serverId = 0,
-            account = account.uppercase(),
-            clientSeed = clientSeed,
-            digest = digest
-        )
+        val authCrypt = AuthCrypt()
+        authCrypt.initialize(sessionKey)
+        connection.setCrypt(authCrypt)
         
-        // WotLK: CMSG_AUTH_SESSION must be sent unencrypted
-        connection.setCrypt(AuthCrypt(sessionKey))
-        sendPacket(authPacket)
+        val writer = ByteWriter()
+        writer.writeInt(12340)                          // Build
+        writer.writeInt(0)                              // Server ID
+        writer.writeString(account.uppercase())
+        writer.writeByte(0)                             // Null Term
+        writer.writeInt(0)                              // Unknown
+        writer.writeInt(clientSeed)
+        writer.writeInt(0)                              // Unknown
+        writer.writeInt(0)                              // Unknown
+        writer.writeInt(0)                              // Unknown
+        writer.writeBytes(digest)
+        writer.writeInt(0)                              // Addon Info Size
+
+        connection.send(0x1ED, writer.toByteArray())
         
-        // Transition Timing Fix: 
-        // Enable encryption (outgoing) and decryption (incoming) immediately after sending CMSG_AUTH_SESSION.
-        // SMSG_AUTH_RESPONSE header is expected to be encrypted in AzerothCore 3.3.5a.
         connection.enableEncryption(true)
         connection.enableDecryption(true)
     }
 
-    private fun startKeepAlive() {
-        keepAliveJob?.cancel()
-        keepAliveJob = scope.launch {
-            var sequence = 0
-            while (isActive) {
-                delay(30000)
-                sendPacket(WorldClientPing(sequence++))
-            }
-        }
-    }
-
-    suspend fun sendPacket(packet: com.guildchat.protocol.Packet) {
+    suspend fun sendPacket(opcode: Int, payload: ByteArray) = connection.send(opcode, payload)
+    suspend fun selectCharacter(guid: Long) = sendPacket(0x003D, ByteWriter().apply { writeLong(guid) }.toByteArray())
+    
+    suspend fun sendChat(type: ChatType, message: String, target: String, channel: String) {
         val writer = ByteWriter()
-        packet.write(writer)
-        connection.send(packet.opcode, writer.toByteArray())
-    }
-
-    suspend fun selectCharacter(guid: Long) {
-        sendPacket(WorldClientPlayerLogin(guid))
-    }
-
-    suspend fun selectRealm(realm: com.guildchat.protocol.auth.Realm) {
-        // Handled via connect() in this class
-    }
-
-    suspend fun sendChat(type: ChatType, message: String, target: String = "", channel: String = "") {
-        sendPacket(ChatClientMessage(type = type, message = message, target = target, channel = channel))
+        writer.writeInt(type.value)
+        writer.writeInt(-1)
+        if (type == ChatType.WHISPER || type == ChatType.CHANNEL) {
+            writer.writeString(if (type == ChatType.CHANNEL) channel else target)
+            writer.writeByte(0)
+        }
+        writer.writeString(message)
+        writer.writeByte(0)
+        sendPacket(0x0095, writer.toByteArray())
     }
 
     fun disconnect() {
-        keepAliveJob?.cancel()
-        scope.cancel()
         connection.disconnect()
+        scope.cancel()
         _state.value = SessionState.Disconnected
     }
 }
